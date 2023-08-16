@@ -13,7 +13,6 @@ import numpy as np
 from tqdm import tqdm
 import logging
 import bitsandbytes as bnb
-import pandas as pd
 
 import torch
 import transformers
@@ -29,8 +28,8 @@ from transformers import (
     LlamaTokenizer,
     get_scheduler,
     GenerationConfig
-
 )
+
 from datasets import load_dataset, Dataset
 import evaluate
 
@@ -46,8 +45,10 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from torch.utils.data import DataLoader
 
 from torch.optim import AdamW
+from accelerate import Accelerator
 
 import wandb
+import gc
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -55,6 +56,8 @@ logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
+
+
 
 @dataclass
 class ModelArguments:
@@ -193,38 +196,9 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     save_strategy: str = field(default='steps', metadata={"help": 'When to save checkpoints'})
     save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
     save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
-
-@dataclass
-class GenerationArguments:
-    # For more hyperparameters check:
-    # https://huggingface.co/docs/transformers/main_classes/text_generation#transformers.GenerationConfig
-    # Length arguments
-    max_new_tokens: Optional[int] = field(
-        default=256,
-        metadata={"help": "Maximum number of new tokens to be generated in evaluation or prediction loops"
-                          "if predict_with_generate is set."}
-    )
-    min_new_tokens : Optional[int] = field(
-        default=None,
-        metadata={"help": "Minimum number of new tokens to generate."}
-    )
-
-    # Generation strategy
-    do_sample: Optional[bool] = field(default=False)
-    num_beams: Optional[int] = field(default=1)
-    num_beam_groups: Optional[int] = field(default=1)
-    penalty_alpha: Optional[float] = field(default=None)
-    use_cache: Optional[bool] = field(default=True)
-
-    # Hyperparameters for logit manipulation
-    temperature: Optional[float] = field(default=1.0)
-    top_k: Optional[int] = field(default=50)
-    top_p: Optional[float] = field(default=1.0)
-    typical_p: Optional[float] = field(default=1.0)
-    diversity_penalty: Optional[float] = field(default=0.0)
-    repetition_penalty: Optional[float] = field(default=1.0)
-    length_penalty: Optional[float] = field(default=1.0)
-    no_repeat_ngram_size: Optional[int] = field(default=0)
+    beta: float = field(default=0.01, metadata={"help": 'KL penalty'})
+    num_epochs: int = field(default=1, metadata={"help": 'How many epochs to do'})
+    max_new_tokens: Optional[int] = field(default=50, metadata={"help": "Maximum number of new tokens to be generated in roll out"})
 
 def find_all_linear_names(args, model):
     cls = bnb.nn.Linear4bit if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
@@ -272,13 +246,11 @@ def get_models(args, checkpoint_dir):
     print(f'loading base model {args.model_name_or_path}...')
     compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
     
-    torch.cuda.empty_cache()
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         cache_dir=args.cache_dir,
         load_in_4bit=args.bits == 4,
         load_in_8bit=args.bits == 8,
-        device_map={"" : 0},
         quantization_config=BitsAndBytesConfig(
             load_in_4bit=args.bits == 4,
             load_in_8bit=args.bits == 8,
@@ -304,12 +276,6 @@ def get_models(args, checkpoint_dir):
 
     model.config.torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
 
-    model_ref = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        device_map={"": 1},
-        torch_dtype=torch.bfloat16,
-    )
-
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
@@ -323,8 +289,7 @@ def get_models(args, checkpoint_dir):
         smart_tokenizer_and_embedding_resize(
             special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
             tokenizer=tokenizer,
-            model=model,
-            model_ref=model_ref
+            model=model
         )
     if 'llama' in args.model_name_or_path or isinstance(tokenizer, LlamaTokenizer):
         # LLaMA tokenizer may not have correct special tokens set.
@@ -341,7 +306,7 @@ def get_models(args, checkpoint_dir):
         })
     
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
-    
+
     if checkpoint_dir is not None:
         print("Loading adapters from checkpoint.")
         model = PeftModel.from_pretrained(model, join(checkpoint_dir, 'adapter_model'), is_trainable=True)
@@ -364,13 +329,14 @@ def get_models(args, checkpoint_dir):
                 module = module.to(torch.bfloat16)
         if 'norm' in name:
             module = module.to(torch.float32)
-        # if 'lm_head' in name or 'embed_tokens' in name:
-        #     if hasattr(module, 'weight'):
-        #         if args.bf16 and module.weight.dtype == torch.float32:
-        #             module = module.to(torch.bfloat16)
-        #         print(module.weight.dtype)
+        ### This needs to be disabled because in generation it complains then ###
+        if 'lm_head' in name or 'embed_tokens' in name:
+            if hasattr(module, 'weight'):
+                if args.bf16 and module.weight.dtype == torch.float32:
+                    module = module.to(torch.bfloat16)
+                print(module.weight.dtype)
 
-    return model, model_ref, tokenizer
+    return model, tokenizer
 
 def print_trainable_parameters(args, model):
     """
@@ -392,12 +358,6 @@ def print_trainable_parameters(args, model):
         if 'lm_head' in name:
             print(param.requires_grad)
             print(param.grad)
-        # if 'q_proj' in name:
-        #     print('-----')
-        #     print(name)
-        #     print(param.requires_grad)
-        #     print(param.grad)
-        #     print('-----')
     if args.bits == 4: trainable_params /= 2
     print(
         f"trainable params: {trainable_params} || "
@@ -408,16 +368,14 @@ def print_trainable_parameters(args, model):
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
     tokenizer: transformers.PreTrainedTokenizer,
-    model: transformers.PreTrainedModel,
-    model_ref: transformers.PreTrainedModel,
-):
+    model: transformers.PreTrainedModel
+    ):
     """Resize tokenizer and embedding.
 
     Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
     """
     num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
     model.resize_token_embeddings(len(tokenizer))
-    model_ref.resize_token_embeddings(len(tokenizer))
     
     if num_new_tokens > 0:
         input_embeddings_data = model.get_input_embeddings().weight.data
@@ -428,19 +386,10 @@ def smart_tokenizer_and_embedding_resize(
 
         input_embeddings_data[-num_new_tokens:] = input_embeddings_avg
         output_embeddings_data[-num_new_tokens:] = output_embeddings_avg
-
-        input_embeddings_data_ref = model_ref.get_input_embeddings().weight.data
-        output_embeddings_data_ref = model_ref.get_output_embeddings().weight.data
-
-        input_embeddings_avg = input_embeddings_data_ref[:-num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings_data_ref[:-num_new_tokens].mean(dim=0, keepdim=True)
-
-        input_embeddings_data_ref[-num_new_tokens:] = input_embeddings_avg
-        output_embeddings_data_ref[-num_new_tokens:] = output_embeddings_avg
         
 def load_and_split_data(args):
      # Load dataset.
-    dataset = load_dataset("json", data_files={"train": 'data/dpo/anthropic_DPO_train.json', "eval" : 'data/dpo/anthropic_DPO_test.json'})
+    dataset = load_dataset("json", data_files={"train": 'data/dpo/oasst1_dpo_train.json', "eval" : 'data/dpo/oasst1_dpo_test.json'})
 
     # Split train/eval, reduce size
     if args.do_eval or args.do_predict:
@@ -479,110 +428,102 @@ def get_last_checkpoint(checkpoint_dir):
         return checkpoint_dir, is_completed # checkpoint found!
     return None, False # first training
 
-def dpo_loss(pi_logps, ref_logps, yw_idxs, yl_idxs, beta):
+def dpo_loss(pi_yw_logps, ref_yw_logps, pi_yl_logps, ref_yl_logps, beta):
 
-    """
-    pi_logps: policy logprobs, shape (B,)
-    ref_logps: reference model logprobs, shape (B,)
-    yw_idxs: preferred completion indices in [0, B-1], shape (T,)
-    yl_idxs: dispreferred completion indices in [0, B-1], shape (T,)
-    beta: temperature controlling strength of KL penalty
-    Each pair of (yw_idxs[i], yl_idxs[i]) represents the
-    indices of a single preference pair.
-    """
+    pi_logratios = pi_yw_logps - pi_yl_logps
+    ref_logratios = ref_yw_logps - ref_yl_logps
 
-    pi_yw_logps = torch.gather(pi_logps, -1, yw_idxs.unsqueeze(-1).to('cuda:0')).squeeze(-1)
-    pi_yl_logps = torch.gather(pi_logps, -1, yl_idxs.unsqueeze(-1).to('cuda:0')).squeeze(-1)
-    ref_yw_logps = torch.gather(ref_logps, -1, yw_idxs.unsqueeze(-1).to('cuda:1')).squeeze(-1)
-    ref_yl_logps = torch.gather(ref_logps, -1, yl_idxs.unsqueeze(-1).to('cuda:1')).squeeze(-1)
+    losses = -F.logsigmoid(beta * (pi_logratios - ref_logratios))
+    rewards_chosen = beta * (pi_yw_logps - ref_yw_logps).detach().to('cpu')
+    rewards_rejected = beta * (pi_yl_logps - ref_yl_logps).detach().to('cpu')
 
-    pi_logratios = pi_yw_logps.sum(dim=-1) - pi_yl_logps.sum(dim=-1)
-    ref_logratios = ref_yw_logps.sum(dim=-1) - ref_yl_logps.sum(dim=-1)
+    return losses, rewards_chosen, rewards_rejected
 
-    losses = -F.logsigmoid(beta * (pi_logratios - ref_logratios.to('cuda:0')))
-    rewards = beta * (pi_logps - ref_logps.to('cuda:0')).detach().to('cpu')
+def prepare_example(idx, batch, tokenizer, max_length=512):
+
+    b = {k: tokenizer(v[idx], add_special_tokens=False, truncation=True, return_tensors="pt", padding="max_length", max_length=max_length) for k, v in batch.items()}
+                
+    chosen_response = {s : torch.cat((b['prompt'][s], b['chosen'][s]), -1) for s in b['chosen']}
+    rejected_response = {s : torch.cat((b['prompt'][s], b['rejected'][s]), -1) for s in b['rejected']}
+    b['chosen'] = chosen_response
+    b['rejected'] = rejected_response
+    l_p = b['prompt']['input_ids'].shape[-1]
+    chosen_labels = chosen_response['input_ids'].clone()
+    chosen_labels[0, :l_p] = -100
+    rejected_labels = rejected_response['input_ids'].clone()
+    rejected_labels[0, :l_p] = -100
+    b['chosen_labels'] = chosen_labels
+    b['rejected_labels'] = rejected_labels
+
+    concatenated = {}
+    concatenated['response'] = {s : torch.cat((b['chosen'][s], b['rejected'][s]), -1) for s in b['rejected']}
+    concatenated['labels'] = torch.cat((b['chosen_labels'], b['rejected_labels']), -1)
+
+    l = b['chosen']['input_ids'].shape[-1] - l_p
     
-    return losses, rewards
-
-def generate(input, model, max_new_tokens):
-    device = input['input_ids'].device
-    log_pp = torch.tensor([]).to(device)
-    for i in range(max_new_tokens):
-        fwd = model(**input, use_cache=False)['logits'][0, -1]
-        log_p = F.log_softmax(fwd, dim=-1)
-        next_tok = torch.argmax(log_p).unsqueeze(0)
-        input['input_ids'] = torch.cat((input['input_ids'].squeeze(0), next_tok), 0).unsqueeze(0)
-        input['attention_mask'] = torch.ones_like(input['input_ids'])
-        log_pp = torch.cat((log_pp, log_p.unsqueeze(0)), 0)
-
-    return log_pp
+    return l, concatenated 
 
 
-def epoch(model, model_ref, loader, tokenizer, optimizer, scheduler, max_new_tokens, beta, status='train'):
+def epoch(model, accelerator, loader, tokenizer, optimizer, scheduler, beta, status='train'):
 
-    for batch in loader:
-        
-        batch_size = len(batch['prompt'])
+    for step, batch in enumerate(loader):
+        with accelerator.accumulate(model):
+            loss = 0
+            r_c = torch.tensor([])
+            r_r = torch.tensor([])
+            bs = len(batch['prompt'])
+            for idx in range(bs):
 
-        b = {k: tokenizer(v, return_tensors="pt", padding=True, truncation=True, max_length=512) for k, v in batch.items()}
-        
-        # max_new_tokens = min(b['chosen']['input_ids'].shape[-1], b['rejected']['input_ids'].shape[-1])
+                l, concatenated = prepare_example(idx, batch, tokenizer)
 
-        pi_logps = torch.tensor([]).to('cuda:0')
-        ref_logps = torch.tensor([]).to('cuda:1')
-        for i in range(batch_size):
-            input = tokenizer(batch['prompt'][i], return_tensors="pt", truncation=True, max_length=512).to('cuda:0')
-            log_p = generate(input=input, model=model, max_new_tokens=max_new_tokens)
-            pi_logps = torch.cat((pi_logps, log_p.unsqueeze(0)), 0)
+                fwd = model(**concatenated['response'], use_cache=False)['logits'][:, :-1]
+                labels = concatenated['labels'][0, 1:]
+                mask = torch.argwhere(labels != -100).view(-1) # positions of non-prompt part of chosen input
+                y_idx = labels[mask]
 
-            with torch.no_grad():
-                log_p = generate(input=input.to('cuda:1'), model=model_ref, max_new_tokens=max_new_tokens)
-                ref_logps = torch.cat((ref_logps, log_p.unsqueeze(0)), 0)
-            
-        # print('pi logs', pi_logps)
-        # print('ref logs', ref_logps)
+                pi_yw_logps = F.log_softmax(fwd, dim=-1)[:, mask[:l], y_idx[:l]].sum()
+                pi_yl_logps = F.log_softmax(fwd, dim=-1)[:, mask[l:], y_idx[l:]].sum()
 
-        # TODO
-        # Deal with the fact that when we generate in the reference model, you could end up generating the EOS before max_new_tokens is reached. 
-        # What do you do in that case? Here we just go on, but you could also truncate all squence lenghts to the shortest one?
+                with torch.no_grad():
+                    with accelerator.unwrap_model(model).disable_adapter():
+                        fwd = model(**concatenated['response'], use_cache=False)['logits'][:, :-1]
 
-        # print('pi_logps grad', pi_logps.requires_grad)
-        # print('ref_logps grad', ref_logps.requires_grad)
+                        ref_yw_logps = F.log_softmax(fwd, dim=-1)[:, mask[:l], y_idx[:l]].sum()
+                        ref_yl_logps = F.log_softmax(fwd, dim=-1)[:, mask[l:], y_idx[l:]].sum()
+                
+                losses, rewards_chosen, rewards_rejected = dpo_loss(pi_yw_logps, pi_yl_logps, ref_yw_logps, ref_yl_logps, beta)
+                loss += losses / bs
 
-        yw_idxs = b['chosen'].input_ids[:, :max_new_tokens]
-        yl_idxs = b['rejected'].input_ids[:, :max_new_tokens]
+                r_c = torch.cat((r_c, rewards_chosen.mean().unsqueeze(0)), 0)
+                r_r = torch.cat((r_r, rewards_rejected.mean().unsqueeze(0)), 0)
 
-        # print(pi_logps.shape)
-        # print(yw_idxs.shape)
+            accelerator.print('step', step, 'loss', loss, 'average rewards chosen', r_c.mean(dim=0), 'average rewards rejected', r_r.mean())
 
-        losses, rewards = dpo_loss(pi_logps=pi_logps, ref_logps=ref_logps, yw_idxs=yw_idxs, yl_idxs=yl_idxs, beta=beta)
+            if status == 'train':
+                optimizer.zero_grad(set_to_none=True)
+                accelerator.backward(loss)
+                optimizer.step()
+                scheduler.step()
 
-        loss = losses.mean(dim=0)
+            accelerator.log({
+                'DPO loss': loss, 
+                'learning rate': scheduler.get_last_lr()[0],
+                'average rewards chosen': r_c.mean(), 
+                'average rewards rejected': r_r.mean()
+                },
+                step=step
+                )
 
-        print('loss', loss, 'av rewards', rewards.mean(dim=0)) # Reward is shaped as (new tokens, vocab size)
-
-        if status == 'train':
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-        wandb.log({'loss_dpo': loss, 'learning rate': scheduler.get_last_lr()[0]})
-
-        del pi_logps
-        del losses
-        del rewards 
-        del loss
-        del ref_logps
+            del loss, losses, r_c, r_r, concatenated
+            gc.collect()
 
 def train():
 
     hfparser = transformers.HfArgumentParser((
-        ModelArguments, DataArguments, TrainingArguments, GenerationArguments
+        ModelArguments, DataArguments, TrainingArguments
     ))
-    model_args, data_args, training_args, generation_args, extra_args = \
+    model_args, data_args, training_args, extra_args = \
         hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
-    training_args.generation_config = transformers.GenerationConfig(**vars(generation_args))
     args = argparse.Namespace(
         **vars(model_args), **vars(data_args), **vars(training_args)
     )
@@ -591,76 +532,95 @@ def train():
     if completed_training:
         print('Detected that training was already completed!')
 
-    model, model_ref, tokenizer = get_models(args, checkpoint_dir)
-    print('Parametrized model loaded on', model.device)
-    print(torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0))
-    print('Reference model loaded on', model_ref.device)
-    print(torch.cuda.memory_reserved(1) - torch.cuda.memory_allocated(1))
-
-    model_ref.eval()
+    model, tokenizer = get_models(args, checkpoint_dir)
 
     model.config.use_cache = False
-    print('loaded model')
+    print('loaded models')
     set_seed(args.seed)
 
-    batch_size = 8
+    batch_size = args.per_device_train_batch_size
     train_ds, eval_ds = load_and_split_data(args=args)
+    
+    max_number_examples = args.max_train_samples
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size)
-    eval_loader = DataLoader(eval_ds, batch_size=batch_size)
+    if max_number_examples is not None:
+        train_ds = train_ds.select(range(max_number_examples))
 
-    beta = 0.01
+    train_loader = DataLoader(train_ds, batch_size=batch_size, pin_memory=True)
+    eval_loader = DataLoader(eval_ds, batch_size=batch_size, pin_memory=True)
 
-    num_epochs = 1 
+    beta = args.beta
+
+    num_epochs = args.num_epochs
     num_training_steps = num_epochs * len(train_loader)
     num_warmup_steps = args.warmup_ratio * num_training_steps
 
-    max_new_tokens = 50
+    max_new_tokens = args.max_new_tokens
 
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
-    scheduler = get_scheduler("cosine", 
+    scheduler = get_scheduler(args.lr_scheduler_type, 
                               optimizer=optimizer, 
                               num_warmup_steps=num_warmup_steps, 
                               num_training_steps=num_training_steps,
-                              )
+                            )
+    
+    # if args.gradient_checkpointing:
+    #     model.gradient_checkpointing_enable()
+    
+    accelerator = Accelerator(mixed_precision="bf16", 
+                              log_with="wandb", 
+                              gradient_accumulation_steps=args.gradient_accumulation_steps
+                            )
+
+    model, optimizer, train_loader, eval_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, eval_loader, scheduler
+    )
+
+    print('Parametrized model loaded on', model.device)
+
     print('training started')
 
-    run = wandb.init(project="QLoRA + DPO",
-                     config={"beta": beta, 
-                             "learning rate": args.learning_rate, 
-                             "max new tokens": max_new_tokens,
-                             "batch size": batch_size,
-                             }
+    accelerator.init_trackers(project_name="QLoRA + DPO",
+                        config={"beta": beta, 
+                                "learning rate": args.learning_rate, 
+                                "batch size": batch_size,
+                                "epochs": num_epochs 
+                                }
                      )
 
     for _ in range(num_epochs):
 
         model.train()
         epoch(model=model, 
-              model_ref=model_ref, 
+              accelerator=accelerator,
               loader=train_loader, 
               tokenizer=tokenizer, 
               optimizer=optimizer,
               scheduler=scheduler, 
-              max_new_tokens=max_new_tokens,
               beta=beta, 
               status='train',
               )
         
-        model.eval()
-        epoch(model=model, 
-              model_ref=model_ref, 
-              loader=eval_loader, 
-              tokenizer=tokenizer, 
-              optimizer=optimizer, 
-              scheduler=scheduler,
-              max_new_tokens=max_new_tokens,
-              beta=beta, 
-              status='eval',
-              )
+        # model.eval()
+        # print('evaluating')
+        # epoch(model=model, 
+        #       accelerator=accelerator,
+        #       loader=eval_loader, 
+        #       tokenizer=tokenizer, 
+        #       optimizer=optimizer, 
+        #       scheduler=scheduler,
+        #       max_new_tokens=max_new_tokens,
+        #       beta=beta, 
+        #       status='eval',
+        #       )
 
-    wandb.finish()
+    accelerator.end_training()
+
+    print('Saving PEFT adapter model...')
+
+    peft_model_path = os.path.join(args.output_dir, "adapter_model")
+    model.save_pretrained(peft_model_path)
 
 if __name__ == "__main__":
     train()
