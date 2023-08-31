@@ -1,4 +1,4 @@
-# QLORA meets DPO
+# QLoRA meets DPO
 
 We combine the computational efficiency of QLoRA with the DPO algorithm. 
 
