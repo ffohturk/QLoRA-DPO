@@ -58,7 +58,6 @@ IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
 
 
-
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(
@@ -75,9 +74,6 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    eval_dataset_size: int = field(
-        default=1024, metadata={"help": "Size of validation dataset."}
-    )
     max_train_samples: Optional[int] = field(
         default=None,
         metadata={
@@ -85,62 +81,19 @@ class DataArguments:
             "value if set."
         },
     )
-    max_eval_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
-            "value if set."
-        },
-    )
-    source_max_len: int = field(
-        default=1024,
-        metadata={"help": "Maximum source sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
-    target_max_len: int = field(
-        default=256,
-        metadata={"help": "Maximum target sequence length. Sequences will be right padded (and possibly truncated)."},
+    max_len: int = field(
+        default=512,
+        metadata={"help": "Maximum length of prompt, rejected and chosen response. Sequences will be right padded (and possibly truncated)."},
     )
     dataset: str = field(
-        default='alpaca',
+        default='oasst1_dpo',
         metadata={"help": "Which dataset to finetune on. See datamodule for options."}
-    )
-    dataset_format: Optional[str] = field(
-        default=None,
-        metadata={"help": "Which dataset format is used. [alpaca|chip2|self-instruct|hh-rlhf]"}
     )
 
 @dataclass
 class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     cache_dir: Optional[str] = field(
         default=None
-    )
-    train_on_source: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Whether to train on the input in addition to the target text."}
-    )
-    mmlu_split: Optional[str] = field(
-        default='eval',
-        metadata={"help": "The MMLU split to run on"}
-    )
-    mmlu_dataset: Optional[str] = field(
-        default='mmlu-fs',
-        metadata={"help": "MMLU dataset to use: options are `mmlu-zs` for zero-shot or `mmlu-fs` for few shot."}
-    )
-    do_mmlu_eval: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Whether to run the MMLU evaluation."}
-    )
-    max_mmlu_samples: Optional[int] = field(
-        default=None,
-        metadata={"help": "If set, only evaluates on `max_mmlu_samples` of the MMMLU dataset."}
-    )
-    mmlu_source_max_len: int = field(
-        default=2048,
-        metadata={"help": "Maximum source sequence length for mmlu."}
-    )
-    full_finetune: bool = field(
-        default=False,
-        metadata={"help": "Finetune the entire model without adapters."}
     )
     adam8bit: bool = field(
         default=False,
@@ -182,23 +135,15 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     optim: str = field(default='paged_adamw_32bit', metadata={"help": 'The optimizer to be used'})
     per_device_train_batch_size: int = field(default=1, metadata={"help": 'The training batch size per GPU. Increase for better speed.'})
     gradient_accumulation_steps: int = field(default=16, metadata={"help": 'How many gradients to accumulate before to perform an optimizer step'})
-    max_steps: int = field(default=10000, metadata={"help": 'How many optimizer update steps to take'})
     weight_decay: float = field(default=0.0, metadata={"help": 'The L2 weight decay rate of AdamW'}) # use lora dropout instead for regularization if needed
     learning_rate: float = field(default=0.0002, metadata={"help": 'The learnign rate'})
-    remove_unused_columns: bool = field(default=False, metadata={"help": 'Removed unused columns. Needed to make this codebase work.'})
     max_grad_norm: float = field(default=0.3, metadata={"help": 'Gradient clipping max norm. This is tuned and works well for all models tested.'})
     gradient_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
-    do_train: bool = field(default=True, metadata={"help": 'To train or not to train, that is the question?'})
     lr_scheduler_type: str = field(default='constant', metadata={"help": 'Learning rate schedule. Constant a bit better than cosine, and has advantage for analysis'})
     warmup_ratio: float = field(default=0.03, metadata={"help": 'Fraction of steps to do a warmup for'})
-    logging_steps: int = field(default=10, metadata={"help": 'The frequency of update steps after which to log the loss'})
     group_by_length: bool = field(default=True, metadata={"help": 'Group sequences into batches with same length. Saves memory and speeds up training considerably.'})
-    save_strategy: str = field(default='steps', metadata={"help": 'When to save checkpoints'})
-    save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
-    save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
     beta: float = field(default=0.01, metadata={"help": 'KL penalty'})
     num_epochs: int = field(default=1, metadata={"help": 'How many epochs to do'})
-    max_new_tokens: Optional[int] = field(default=50, metadata={"help": "Maximum number of new tokens to be generated in roll out"})
 
 def find_all_linear_names(args, model):
     cls = bnb.nn.Linear4bit if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
@@ -212,34 +157,6 @@ def find_all_linear_names(args, model):
     if 'lm_head' in lora_module_names: # needed for 16-bit
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
-
-
-class SavePeftModelCallback(transformers.TrainerCallback):
-    def save_model(self, args, state, kwargs):
-        print('Saving PEFT checkpoint...')
-        if state.best_model_checkpoint is not None:
-            checkpoint_folder = os.path.join(state.best_model_checkpoint, "adapter_model")
-        else:
-            checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
-
-        peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
-        kwargs["model"].save_pretrained(peft_model_path)
-
-        pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
-        if os.path.exists(pytorch_model_path):
-            os.remove(pytorch_model_path)
-
-    def on_save(self, args, state, control, **kwargs):
-        self.save_model(args, state, kwargs)
-        return control
-
-    def on_train_end(self, args, state, control, **kwargs):
-        def touch(fname, times=None):
-            with open(fname, 'a'):
-                os.utime(fname, times)
-
-        touch(join(args.output_dir, 'completed'))
-        self.save_model(args, state, kwargs)
 
 def get_models(args, checkpoint_dir):
 
@@ -280,9 +197,9 @@ def get_models(args, checkpoint_dir):
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
         cache_dir=args.cache_dir,
-        padding_side="right",
+        padding_side="left",
         use_fast=False, # Fast tokenizer giving issues.
-        tokenizer_type='llama' if 'llama' in args.model_name_or_path else None, # Needed for HF name change
+        tokenizer_type='llama', ## I am always using the llama tokenizer ## if 'llama' in args.model_name_or_path else None, # Needed for HF name change
         use_auth_token=args.use_auth_token,
     )
     if tokenizer._pad_token is None:
@@ -329,7 +246,6 @@ def get_models(args, checkpoint_dir):
                 module = module.to(torch.bfloat16)
         if 'norm' in name:
             module = module.to(torch.float32)
-        ### This needs to be disabled because in generation it complains then ###
         if 'lm_head' in name or 'embed_tokens' in name:
             if hasattr(module, 'weight'):
                 if args.bf16 and module.weight.dtype == torch.float32:
@@ -389,28 +305,10 @@ def smart_tokenizer_and_embedding_resize(
         
 def load_and_split_data(args):
      # Load dataset.
-    dataset = load_dataset("json", data_files={"train": 'data/dpo/oasst1_dpo_train.json', "eval" : 'data/dpo/oasst1_dpo_test.json'})
-
-    # Split train/eval, reduce size
-    if args.do_eval or args.do_predict:
-        if 'eval' in dataset:
-            eval_dataset = dataset['eval']
-        else:
-            print('Splitting train dataset in train and validation according to `eval_dataset_size`')
-            dataset = dataset["train"].train_test_split(
-                test_size=args.eval_dataset_size, shuffle=True, seed=42
-            )
-            eval_dataset = dataset['test']
-        if args.max_eval_samples is not None and len(eval_dataset) > args.max_eval_samples:
-            eval_dataset = eval_dataset.select(range(args.max_eval_samples))
-        # if args.group_by_length:
-        #     eval_dataset = eval_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
-    if args.do_train:
-        train_dataset = dataset['train']
-        if args.max_train_samples is not None and len(train_dataset) > args.max_train_samples:
-            train_dataset = train_dataset.select(range(args.max_train_samples))
-        if args.group_by_length:
-            train_dataset = train_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
+    if args.dataset == 'oasst1_dpo_1':
+        dataset = load_dataset("json", data_files={"train": 'data/dpo/oasst1_dpo_train_1.json', "eval" : 'data/dpo/oasst1_dpo_test_1.json'})
+    train_dataset = dataset['train']
+    eval_dataset = dataset['eval']
 
     return train_dataset, eval_dataset
 
@@ -428,9 +326,10 @@ def get_last_checkpoint(checkpoint_dir):
         return checkpoint_dir, is_completed # checkpoint found!
     return None, False # first training
 
-def dpo_loss(pi_yw_logps, ref_yw_logps, pi_yl_logps, ref_yl_logps, beta):
+def dpo_loss(pi_yw_logps, pi_yl_logps, ref_yw_logps, ref_yl_logps, beta):
 
     pi_logratios = pi_yw_logps - pi_yl_logps
+
     ref_logratios = ref_yw_logps - ref_yl_logps
 
     losses = -F.logsigmoid(beta * (pi_logratios - ref_logratios))
@@ -439,10 +338,17 @@ def dpo_loss(pi_yw_logps, ref_yw_logps, pi_yl_logps, ref_yl_logps, beta):
 
     return losses, rewards_chosen, rewards_rejected
 
-def prepare_example(idx, batch, tokenizer, max_length=512):
+def pad_to_length(input, max_length, padding_value):
+    
+    p = padding_value*torch.ones(size=(input.shape[0], max_length - input.shape[-1]), dtype=torch.int64)
 
-    b = {k: tokenizer(v[idx], add_special_tokens=False, truncation=True, return_tensors="pt", padding="max_length", max_length=max_length) for k, v in batch.items()}
-                
+    return torch.cat((input, p), -1)
+
+
+def prepare_batch(batch, tokenizer, max_length):
+
+    b = {k: tokenizer(v, add_special_tokens=False, truncation=True, padding=True, return_tensors="pt", max_length=max_length) for k, v in batch.items() if k not in ['lang', 'parent_id']}
+
     chosen_response = {s : torch.cat((b['prompt'][s], b['chosen'][s]), -1) for s in b['chosen']}
     rejected_response = {s : torch.cat((b['prompt'][s], b['rejected'][s]), -1) for s in b['rejected']}
     b['chosen'] = chosen_response
@@ -455,67 +361,117 @@ def prepare_example(idx, batch, tokenizer, max_length=512):
     b['chosen_labels'] = chosen_labels
     b['rejected_labels'] = rejected_labels
 
+    l_max = max(b['chosen']['input_ids'].shape[-1], b['rejected']['input_ids'].shape[-1])
+
     concatenated = {}
-    concatenated['response'] = {s : torch.cat((b['chosen'][s], b['rejected'][s]), -1) for s in b['rejected']}
-    concatenated['labels'] = torch.cat((b['chosen_labels'], b['rejected_labels']), -1)
+    concatenated['response'] = {s : torch.cat((
+                            pad_to_length(b['chosen'][s], l_max, padding_value=(tokenizer.pad_token_id if s == 'input_ids' else 0)), 
+                            pad_to_length(b['rejected'][s], l_max, padding_value=(tokenizer.pad_token_id if s == 'input_ids' else 0))), 0) 
+                            for s in b['chosen']}
+    concatenated['labels'] = torch.cat((
+                            pad_to_length(b['chosen_labels'], l_max, padding_value=tokenizer.pad_token_id), 
+                            pad_to_length(b['rejected_labels'], l_max, padding_value=tokenizer.pad_token_id)), 0)
 
-    l = b['chosen']['input_ids'].shape[-1] - l_p
-    
-    return l, concatenated 
-
-
-def epoch(model, accelerator, loader, tokenizer, optimizer, scheduler, beta, status='train'):
-
-    for step, batch in enumerate(loader):
-        with accelerator.accumulate(model):
-            loss = 0
-            r_c = torch.tensor([])
-            r_r = torch.tensor([])
-            bs = len(batch['prompt'])
-            for idx in range(bs):
-
-                l, concatenated = prepare_example(idx, batch, tokenizer)
-
-                fwd = model(**concatenated['response'], use_cache=False)['logits'][:, :-1]
-                labels = concatenated['labels'][0, 1:]
-                mask = torch.argwhere(labels != -100).view(-1) # positions of non-prompt part of chosen input
-                y_idx = labels[mask]
-
-                pi_yw_logps = F.log_softmax(fwd, dim=-1)[:, mask[:l], y_idx[:l]].sum()
-                pi_yl_logps = F.log_softmax(fwd, dim=-1)[:, mask[l:], y_idx[l:]].sum()
-
-                with torch.no_grad():
-                    with accelerator.unwrap_model(model).disable_adapter():
-                        fwd = model(**concatenated['response'], use_cache=False)['logits'][:, :-1]
-
-                        ref_yw_logps = F.log_softmax(fwd, dim=-1)[:, mask[:l], y_idx[:l]].sum()
-                        ref_yl_logps = F.log_softmax(fwd, dim=-1)[:, mask[l:], y_idx[l:]].sum()
+    return concatenated
                 
-                losses, rewards_chosen, rewards_rejected = dpo_loss(pi_yw_logps, pi_yl_logps, ref_yw_logps, ref_yl_logps, beta)
-                loss += losses / bs
+def compute_step(batch, model, tokenizer, accelerator, beta, max_length):
 
-                r_c = torch.cat((r_c, rewards_chosen.mean().unsqueeze(0)), 0)
-                r_r = torch.cat((r_r, rewards_rejected.mean().unsqueeze(0)), 0)
+    bs = len(batch['prompt'])
 
-            accelerator.print('step', step, 'loss', loss, 'average rewards chosen', r_c.mean(dim=0), 'average rewards rejected', r_r.mean())
+    concatenated = prepare_batch(batch, tokenizer, max_length)
 
-            if status == 'train':
-                optimizer.zero_grad(set_to_none=True)
-                accelerator.backward(loss)
-                optimizer.step()
-                scheduler.step()
+    fwd = model(**concatenated['response'], use_cache=False)['logits'][:, :-1, :]
+    labels = concatenated['labels'][:, 1:].clone()
+    mask = labels != -100
+    labels[labels == -100] = 0
+
+    pi_logps = torch.gather(F.log_softmax(fwd, dim=-1), 2, labels.unsqueeze(2)).squeeze(2)
+
+    pi_yw_logps = (pi_logps * mask).sum(-1)[:bs]
+    pi_yl_logps = (pi_logps * mask).sum(-1)[bs:]
+
+    with torch.no_grad():
+        with accelerator.unwrap_model(model).disable_adapter():
+            fwd = model(**concatenated['response'], use_cache=False)['logits'][:, :-1, :]
+
+            ref_logps = torch.gather(F.log_softmax(fwd, dim=-1), 2, labels.unsqueeze(2)).squeeze(2)
+            
+            ref_yw_logps = (ref_logps * mask).sum(-1)[:bs]
+            ref_yl_logps = (ref_logps * mask).sum(-1)[bs:]
+    
+    losses, rewards_chosen, rewards_rejected = dpo_loss(pi_yw_logps, pi_yl_logps, ref_yw_logps, ref_yl_logps, beta)
+
+    loss = losses.mean()
+    r_c = rewards_chosen.mean()
+    r_r = rewards_rejected.mean()
+    r_a = (rewards_chosen > rewards_rejected).float().mean()
+    r_d = (rewards_chosen - rewards_rejected).mean()
+
+    return loss, [r_c, r_r, r_a, r_d]
+
+def epoch(s, model, accelerator, loader_t, loader_e, tokenizer, optimizer, scheduler, beta, max_length):
+    for step, batch in enumerate(loader_t):
+        step += s
+
+        model.train()
+        with accelerator.accumulate(model):
+            loss, r = compute_step(batch=batch,
+                                    model=model,
+                                    tokenizer=tokenizer,
+                                    accelerator=accelerator,
+                                    beta=beta,
+                                    max_length=max_length
+                                    )
+
+            accelerator.print('step', step, 'loss', loss, 'average rewards chosen', r[0].item(), 'average rewards rejected', r[1].item())
+            
+            optimizer.zero_grad(set_to_none=True)
+            accelerator.backward(loss)
+            optimizer.step()
+            scheduler.step()
 
             accelerator.log({
-                'DPO loss': loss, 
-                'learning rate': scheduler.get_last_lr()[0],
-                'average rewards chosen': r_c.mean(), 
-                'average rewards rejected': r_r.mean()
-                },
-                step=step
-                )
+                    'DPO loss': loss.item(), 
+                    'learning rate': scheduler.get_last_lr()[0],
+                    'average train rewards chosen': r[0].item(), 
+                    'average train rewards rejected': r[1].item(),
+                    'average train rewards acc': r[2].item(),
+                    'average train rewards margin': r[3].item(),
+                    'epochs': step / len(loader_t)
+                    },
+                    step=step
+                    )
 
-            del loss, losses, r_c, r_r, concatenated
+            del loss, r
             gc.collect()
+        
+        if step % 20 == 0 and step > 0:
+            accelerator.print("Evaluating")
+            r_e_av = [0]*4
+            loss_e_av = 0
+            for batch_e in loader_e:
+                model.eval()
+                with torch.no_grad():
+                    loss_e, r_e = compute_step(batch=batch_e,
+                                                      model=model,
+                                                      tokenizer=tokenizer,
+                                                      accelerator=accelerator,
+                                                      beta=beta)
+                    loss_e_av += loss_e.mean() / len(loader_e)
+
+                    r_e_av = [r_e_av[i] + r_e[i].mean() / len(loader_e) for i in range(4)]
+            
+            accelerator.log({
+                    'DPO test loss': loss_e_av, 
+                    'average test rewards chosen': r_e_av[0], 
+                    'average test rewards rejected': r_e_av[1],
+                    'average test rewards acc': r_e_av[2],
+                    'average test rewards margin': r_e_av[3],
+                    },
+                    step=step
+                    )
+
+    return step
 
 def train():
 
@@ -538,7 +494,8 @@ def train():
     print('loaded models')
     set_seed(args.seed)
 
-    batch_size = args.per_device_train_batch_size
+    batch_size_t = args.per_device_train_batch_size
+    batch_size_e = args.per_device_eval_batch_size
     train_ds, eval_ds = load_and_split_data(args=args)
     
     max_number_examples = args.max_train_samples
@@ -546,16 +503,14 @@ def train():
     if max_number_examples is not None:
         train_ds = train_ds.select(range(max_number_examples))
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, pin_memory=True)
-    eval_loader = DataLoader(eval_ds, batch_size=batch_size, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size_t, pin_memory=True)
+    eval_loader = DataLoader(eval_ds, batch_size=batch_size_e, pin_memory=True)
 
     beta = args.beta
 
     num_epochs = args.num_epochs
     num_training_steps = num_epochs * len(train_loader)
     num_warmup_steps = args.warmup_ratio * num_training_steps
-
-    max_new_tokens = args.max_new_tokens
 
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
@@ -565,11 +520,8 @@ def train():
                               num_training_steps=num_training_steps,
                             )
     
-    # if args.gradient_checkpointing:
-    #     model.gradient_checkpointing_enable()
-    
     accelerator = Accelerator(mixed_precision="bf16", 
-                              log_with="wandb", 
+                              log_with=args.report_to, 
                               gradient_accumulation_steps=args.gradient_accumulation_steps
                             )
 
@@ -577,43 +529,30 @@ def train():
         model, optimizer, train_loader, eval_loader, scheduler
     )
 
-    print('Parametrized model loaded on', model.device)
-
     print('training started')
 
     accelerator.init_trackers(project_name="QLoRA + DPO",
                         config={"beta": beta, 
                                 "learning rate": args.learning_rate, 
-                                "batch size": batch_size,
+                                "batch size train": batch_size_t,
+                                "batch size eval": batch_size_e,
                                 "epochs": num_epochs 
                                 }
                      )
-
+    s = 0
     for _ in range(num_epochs):
 
-        model.train()
-        epoch(model=model, 
-              accelerator=accelerator,
-              loader=train_loader, 
-              tokenizer=tokenizer, 
-              optimizer=optimizer,
-              scheduler=scheduler, 
-              beta=beta, 
-              status='train',
-              )
-        
-        # model.eval()
-        # print('evaluating')
-        # epoch(model=model, 
-        #       accelerator=accelerator,
-        #       loader=eval_loader, 
-        #       tokenizer=tokenizer, 
-        #       optimizer=optimizer, 
-        #       scheduler=scheduler,
-        #       max_new_tokens=max_new_tokens,
-        #       beta=beta, 
-        #       status='eval',
-        #       )
+        s = epoch(s=s,
+                model=model, 
+                accelerator=accelerator,
+                loader_t=train_loader,
+                loader_e=eval_loader,
+                tokenizer=tokenizer, 
+                optimizer=optimizer,
+                scheduler=scheduler, 
+                beta=beta,
+                max_length=args.max_len
+                )
 
     accelerator.end_training()
 
@@ -621,6 +560,7 @@ def train():
 
     peft_model_path = os.path.join(args.output_dir, "adapter_model")
     model.save_pretrained(peft_model_path)
+
 
 if __name__ == "__main__":
     train()
