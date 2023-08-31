@@ -1,6 +1,6 @@
-QLORA meets DPO
+# QLORA meets DPO
 
-In this project we combine the computational efficiency of QLoRA with the DPO algorithm. 
+We combine the computational efficiency of QLoRA with the DPO algorithm. 
 
 Many implementations exist, but this is mine. 
 
